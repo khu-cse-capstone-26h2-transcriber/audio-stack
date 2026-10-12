@@ -115,13 +115,14 @@ def main():
         while True:
             conn, _ = srv.accept()
             print("[feed-wav] engine connected", flush=True)
-            conn.setblocking(False)
+            # blocking socket: sendall applies natural backpressure;
+            # drain() polls readability with select() before recv()
             c = AudioStackClient.__new__(AudioStackClient)
             c._sock, c._buf, c._seq = conn, b"", 0
             rbuf = b""
 
             def drain():
-                nonlocal rbuf
+                nonlocal rbuf, seq
                 while True:
                     if not select.select([conn], [], [], 0)[0]:
                         return
@@ -144,14 +145,15 @@ def main():
                                   json.loads(fr["payload"].decode("utf-8")), flush=True)
 
             session_id = "sess-feed-" + time.strftime("%Y%m%d-%H%M%S")
-            c.send_json(MsgType.HELLO, json.dumps({
+            c.send_frame(MsgType.HELLO, json.dumps({
                 "proto": 1, "name": "feed_wav", "version": "0.1.0",
                 "format": {"rate": TARGET_RATE, "channels": 1, "encoding": "s16le"},
                 "chunk_ms": args.chunk_ms, "cache_seconds": 0,
                 "capture_device": "file:" + ";".join(p for p, _ in files),
                 "session_id": session_id,
-            }))
-            c.send_json(MsgType.SESSION_BEGIN, json.dumps({"session_id": session_id}))
+            }).encode("utf-8"))
+            c.send_frame(MsgType.SESSION_BEGIN,
+                         json.dumps({"session_id": session_id}).encode("utf-8"))
 
             looping = True
             while looping:
@@ -173,9 +175,15 @@ def main():
                 if not args.loop:
                     break
 
-            c.send_json(MsgType.SESSION_END, json.dumps({"session_id": session_id}))
+            c.send_frame(MsgType.SESSION_END,
+                         json.dumps({"session_id": session_id}).encode("utf-8"))
             c.send_frame(MsgType.GOODBYE, b'{"reason":"file done"}')
-            time.sleep(0.2)  # let the engine read the last frames
+            # linger: give the engine time to emit its closing RESULT
+            # (its VAD needs trailing silence before it finalizes)
+            end = time.monotonic() + 3.0
+            while time.monotonic() < end:
+                drain()
+                time.sleep(0.05)
             conn.close()
             if not args.loop:
                 print("[feed-wav] done")

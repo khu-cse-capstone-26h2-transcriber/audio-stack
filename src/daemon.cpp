@@ -290,9 +290,13 @@ int main(int argc, char** argv) {
     std::string engine_sock = resolve_socket_path(
         opt.engine_socket.empty() ? cfg.get("engine", "socket", "/run/audiostack/engine.sock")
                                   : opt.engine_socket);
+    // with an explicit --engine-socket, keep ctrl.sock next to it unless the
+    // config's ctrl_socket is usable as-is
+    std::string ctrl_default =
+        engine_sock.substr(0, engine_sock.find_last_of('/') + 1) + "ctrl.sock";
+    std::string ctrl_cfg = cfg.get("engine", "ctrl_socket", "/run/audiostack/ctrl.sock");
     std::string ctrl_sock = resolve_socket_path(
-        cfg.get("engine", "ctrl_socket",
-                engine_sock.substr(0, engine_sock.find_last_of('/') + 1) + "ctrl.sock"));
+        (!opt.engine_socket.empty() && engine_sock.rfind("/run/", 0) != 0) ? ctrl_default : ctrl_cfg);
     EngineIpcServer ipc;
     if (!ipc.start(engine_sock, err)) {
         LOG_ERROR("engine socket: %s", err.c_str());
@@ -598,9 +602,9 @@ int main(int argc, char** argv) {
 
     // ---- graceful shutdown ---------------------------------------------------
     if (ipc.has_client()) {
-        ipc.send_json(MSG_GOODBYE, "{\"reason\":\"daemon shutdown\"}");
         if (session.active)
             ipc.send_json(MSG_SESSION_END, "{\"session_id\":" + json_str(session.id) + "}");
+        ipc.send_json(MSG_GOODBYE, "{\"reason\":\"daemon shutdown\"}");
     }
     if (session.active) {
         std::string id = session.end();

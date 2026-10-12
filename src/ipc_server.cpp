@@ -14,12 +14,6 @@
 namespace astk {
 
 // ---------------------------------------------------------------- utilities --
-static bool set_nonblock(int fd) {
-    int fl = fcntl(fd, F_GETFL, 0);
-    if (fl < 0) return false;
-    return fcntl(fd, F_SETFL, fl | O_NONBLOCK) >= 0;
-}
-
 static bool mkdir_p(const std::string& path) {
     std::string cur;
     size_t i = 0;

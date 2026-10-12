@@ -69,7 +69,7 @@ bool AlsaCapture::try_params(const Request& req, snd_pcm_format_t fmt, std::stri
     if (rc < 0 || period == 0) { err = std::string("set_period_size: ") + snd_strerror(rc); return false; }
 
     snd_pcm_uframes_t buffer = period * req.buffer_periods;
-    rc = snd_pcm_hw_params_set_buffer_size_near(pcm_, hw, &buffer, &dir);
+    rc = snd_pcm_hw_params_set_buffer_size_near(pcm_, hw, &buffer);
     if (rc < 0 || buffer < period * 2) { err = std::string("set_buffer_size: ") + snd_strerror(rc); return false; }
 
     rc = snd_pcm_hw_params(pcm_, hw);
@@ -83,6 +83,12 @@ bool AlsaCapture::try_params(const Request& req, snd_pcm_format_t fmt, std::stri
     snd_pcm_sw_params_set_start_threshold(pcm_, sw, period);
     rc = snd_pcm_sw_params(pcm_, sw);
     if (rc < 0) { err = std::string("snd_pcm_sw_params: ") + snd_strerror(rc); return false; }
+
+    // Start explicitly: a PREPARED capture stream never becomes poll-readable,
+    // and poll()-only loops would deadlock waiting for a stream that only
+    // readi() would auto-start.
+    rc = snd_pcm_start(pcm_);
+    if (rc < 0) { err = std::string("snd_pcm_start: ") + snd_strerror(rc); return false; }
 
     st_ = Status {};
     st_.device = req.device;
@@ -116,6 +122,7 @@ int AlsaCapture::wait_ms(int ms) {
         LOG_WARN("ALSA poll error (device %s), recovering", st_.device.c_str());
         st_.xruns++;
         snd_pcm_recover(pcm_, -EPIPE, 1);
+        if (snd_pcm_state(pcm_) == SND_PCM_STATE_PREPARED) snd_pcm_start(pcm_);
         return -1;
     }
     return (revents & POLLIN) ? 1 : 0;
@@ -128,19 +135,19 @@ snd_pcm_sframes_t AlsaCapture::readi(void* dst, snd_pcm_uframes_t frames) {
         LOG_WARN("ALSA XRUN on %s (total %ld), recovering", st_.device.c_str(), st_.xruns);
         int rc = snd_pcm_recover(pcm_, int(r), 0);
         if (rc < 0) LOG_ERROR("snd_pcm_recover failed: %s", snd_strerror(rc));
+        if (snd_pcm_state(pcm_) == SND_PCM_STATE_PREPARED) snd_pcm_start(pcm_);
     } else if (r < 0) {
         LOG_WARN("snd_pcm_readi(%s): %s", st_.device.c_str(), snd_strerror(int(r)));
         int rc = snd_pcm_recover(pcm_, int(r), 1);
         if (rc < 0) LOG_ERROR("snd_pcm_recover failed: %s", snd_strerror(rc));
+        if (snd_pcm_state(pcm_) == SND_PCM_STATE_PREPARED) snd_pcm_start(pcm_);
     }
     return r;
 }
 
 snd_pcm_sframes_t AlsaCapture::avail() const {
     if (!pcm_) return 0;
-    snd_pcm_sframes_t a = 0;
-    snd_pcm_avail_update(pcm_, &a);
-    return a;
+    return snd_pcm_avail_update(pcm_);
 }
 
 // ------------------------------------------------------------- enumeration --
