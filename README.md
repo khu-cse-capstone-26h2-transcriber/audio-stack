@@ -38,6 +38,21 @@ python3 tests/dummy_engine.py &                # engine stand-in (fake transcrip
 ./build/astk-ctl status                        # daemon state
 ```
 
+### No mic? Use a WAV file instead
+
+```bash
+# 1) sanity-check PyTorch Whisper itself on a real speech sample (no socket):
+python3 client/whisper_engine.py --wav samples/jfk.wav --model small
+
+# 2) full flow without hardware — feed_wav.py streams the file over engine.sock
+#    exactly like the daemon would (start the engine first):
+python3 client/whisper_engine.py --model small --language en &
+python3 tools/feed_wav.py samples/jfk.wav --backend-url http://127.0.0.1:3000
+
+# 3) test the REAL C++ daemon without a mic (snd-aloop loopback card):
+./scripts/feed_wav_loopback.sh samples/jfk.wav
+```
+
 ## Choosing the capture device
 
 | setup | how |
@@ -65,10 +80,12 @@ Run `./build/astk-list-devices` to see all cards. Config lives in
 ```
 include/audiostack/  C++ library headers (ALSA capture, IPC, shm ring, HTTP)
 src/                 library implementation + audiostackd daemon
-tools/               astk-list-devices, astk-capture-wav, astk-ctl
-client/astk_client.py  Python client for the engine (stdlib only)
+tools/               C++ helpers (list-devices, capture-wav, ctl) + feed_wav.py
+client/              astk_client.py (protocol client), whisper_engine.py (PyTorch
+                     Whisper example engine), wav_io.py
 tests/               dummy_engine.py, dummy_backend.js (integration stand-ins)
-scripts/             setup/build/probe/install + udev rules
+samples/             jfk.wav (real speech), synth_speech.wav (VAD test)
+scripts/             setup/build/probe/install + feed_wav_loopback.sh + udev rules
 systemd/             audiostack.service
 docs/                PROTOCOL.md, INTEGRATION-ENGINE.md, INTEGRATION-WEB.md
 dts/                 INMP441 I2S overlay template (experimental)

@@ -3,6 +3,7 @@ build/
 *.a
 *.so
 *.wav
+!samples/*.wav
 *.dtbo
 .cache/
 compile_commands.json

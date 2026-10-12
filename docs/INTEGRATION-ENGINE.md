@@ -6,6 +6,11 @@ whisper.cpp / Qualcomm VoiceAI ASR (QNN), then sends results back.
 
 ## 1. Quick start (Python)
 
+A complete working example — PyTorch Whisper + energy VAD over the protocol —
+lives in **`client/whisper_engine.py`** (it also has an `--wav` offline mode).
+Without any microphone, stream a file with `tools/feed_wav.py`, or test the
+real daemon through a loopback card with `scripts/feed_wav_loopback.sh`.
+
 ```python
 import sys
 sys.path.insert(0, "client")
