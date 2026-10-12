@@ -1,0 +1,50 @@
+/*
+ * inmp441-i2s-overlay.dts — Device Tree Overlay template for an I2S MEMS mic
+ * (INMP441/SPH0645) on the 40-pin header — experimental scaffold.
+ *
+ * Wiring (per the survey): pin12=PCM_CLK(BCLK), pin35=PCM_FS(WS/LRCK),
+ * pin38=PCM_DIN(SD), pin1=3.3V, pin6=GND. L/R select: left=GND, right=3.3V.
+ *
+ * ⚠ On QCS6490 the 40-pin I2S is routed via LPASS/QUP; the board's top-level
+ *   dts is rubikpi3.dts (arch/arm64/boot/dts/qcom). The exact I2S controller
+ *   node/pinmux must be confirmed as part of the kernel work:
+ *   - kernel: enable CONFIG_SND_SOC_SIMPLE_CARD / CONFIG_SND_SOC_INMP441 (=m)
+ *   - pinmux: set the tlmm pins to the I2S function
+ *
+ * compile: dtc -@ -I dts -O dtb -o inmp441-i2s.dtbo inmp441-i2s-overlay.dts
+ * apply:   place in /boot/overlays and register in U-Boot/extlinux (survey §3.2)
+ */
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+
+&fragment {
+	/* target: the Rubik Pi 3 top-level board dts (rubikpi3.dts) — adjust if needed */
+	target-path = "/";
+
+	__overlay__ {
+		inmp441_sound: inmp441-sound {
+			compatible = "simple-audio-card";
+			simple-audio-card,name = "INMP441";
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* CPU DAI side: replace with the actual I2S controller node
+			 * from the board dts, e.g. sound-dai = <&i2sX>; */
+			simple-audio-card,cpu {
+				sound-dai = <&qup_i2s_0>;   /* TODO: real I2S node in the board dts */
+			};
+
+			simple-audio-card,codec {
+				sound-dai = <&inmp441>;
+			};
+		};
+
+		inmp441: inmp441 {
+			compatible = "invensense,inmp441";
+			#sound-dai-cells = <0>;
+			/* INMP441 with L/R tied to GND outputs the left channel */
+		};
+	};
+};

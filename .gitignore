@@ -1,0 +1,10 @@
+build/
+*.o
+*.a
+*.so
+*.wav
+*.dtbo
+.cache/
+compile_commands.json
+__pycache__/
+*.pyc

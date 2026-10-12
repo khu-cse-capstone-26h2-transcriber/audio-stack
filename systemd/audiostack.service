@@ -1,0 +1,33 @@
+[Unit]
+Description=audiostackd - On-device STT audio capture & IPC daemon (Rubik Pi 3)
+Wants=sound.target
+After=sound.target local-fs.target network-online.target
+# USB mics may be plugged in after boot; the daemon retries via Restart=always
+# rather than waiting for a specific card.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/audiostackd --config /etc/audiostack/audiostack.conf
+Restart=always
+RestartSec=2
+
+# single-user embedded board: run as root (simplest ALSA/DSP access)
+User=root
+Group=audio
+
+# real-time capture: raise scheduling priority (within kernel RT limits)
+Nice=-10
+# pin to big cores if desired:
+# CPUAffinity=4 5 6 7
+
+# sockets are created under /run/audiostack (cleaned on restart)
+RuntimeDirectory=audiostack
+RuntimeDirectoryMode=0775
+
+# hardening (optional): minimize surface even as root
+NoNewPrivileges=true
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

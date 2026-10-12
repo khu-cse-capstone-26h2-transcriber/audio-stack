@@ -1,0 +1,26 @@
+# ============================================================================
+# 99-audio.rules — pin USB audio card numbers (survey §3.2)
+# install: sudo cp scripts/udev/99-audio.rules /etc/udev/rules.d/ && sudo udevadm control --reload
+#
+# Option A (recommended): pin the card number via the snd-usb-audio module
+#   index parameter. On the Rubik Pi 3 the on-board card takes card 0, so to
+#   keep a USB mic always at card 1:
+#     echo "options snd-usb-audio index=1" | sudo tee /etc/modprobe.d/99-audio-index.conf
+#
+# Option B: udev attributes/symlinks as a supplement (the card *name* itself
+#   is set by the kernel).
+#   ReSpeaker Mic Array v2.0 = VID 0x2886, PID 0x0018
+#   (note: v2.0 is UAC 1.0 class; the stock snd-usb-audio binds it automatically)
+# ============================================================================
+
+# ReSpeaker USB 4-Mic Array (v2.0/XVF3000): mark it regardless of plug order
+SUBSYSTEM=="sound", ACTION=="add", KERNEL=="card*", \
+  ATTRS{idVendor}=="2886", ATTRS{idProduct}=="0018", \
+  ENV{ASTK_USB_MIC}="respeaker-v2"
+
+# generic UAC1/UAC2 mic marker
+SUBSYSTEM=="sound", ACTION=="add", KERNEL=="card*", \
+  DRIVER=="snd-usb-audio", ENV{ASTK_USB_MIC}="uac"
+
+# explicit access group for capture PCM devices (audio group is the default anyway)
+SUBSYSTEM=="sound", ACTION=="add", KERNEL=="pcm*C*d*", GROUP="audio", MODE="0660"
