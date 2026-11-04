@@ -2,8 +2,8 @@
 Description=audiostackd - On-device STT audio capture & IPC daemon (Rubik Pi 3)
 Wants=sound.target
 After=sound.target local-fs.target network-online.target
-# USB mics may be plugged in after boot; the daemon retries via Restart=always
-# rather than waiting for a specific card.
+# Ubuntu for Qualcomm: verify the configured input before enabling (headset or XVF3800).
+# The daemon retries failures via Restart=always; it does not set the mixer route.
 
 [Service]
 Type=simple

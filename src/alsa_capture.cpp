@@ -6,7 +6,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <poll.h>
 
 namespace astk {
 
@@ -21,15 +20,34 @@ static const struct {
 
 bool AlsaCapture::open(const Request& req, std::string& err) {
     close();
-    int rc = snd_pcm_open(&pcm_, req.device.c_str(), SND_PCM_STREAM_CAPTURE, 0);
+    Request resolved = req;
+    if (req.device == "auto:xvf3800") {
+        resolved.device.clear();
+        for (const auto& pcm : list_pcms()) {
+            if (!pcm.capture) continue;
+            std::ifstream usb("/proc/asound/card" + std::to_string(pcm.card) + "/usbid");
+            std::string id;
+            if (!(usb >> id) || id != "2886:001a") continue;
+            if (!resolved.device.empty()) {
+                err = "multiple XVF3800 capture PCMs found; select one with --device";
+                return false;
+            }
+            resolved.device = "hw:" + std::to_string(pcm.card) + "," + std::to_string(pcm.device);
+        }
+        if (resolved.device.empty()) {
+            err = "no XVF3800 USB capture PCM (2886:001a); check arecord -l or specify --device";
+            return false;
+        }
+    }
+    int rc = snd_pcm_open(&pcm_, resolved.device.c_str(), SND_PCM_STREAM_CAPTURE, 0);
     if (rc < 0) {
         pcm_ = nullptr;
-        err = "snd_pcm_open(" + req.device + "): " + snd_strerror(rc);
+        err = "snd_pcm_open(" + resolved.device + "): " + snd_strerror(rc);
         return false;
     }
     for (const auto& f : kFmtOrder) {
         std::string e;
-        if (try_params(req, f.fmt, e)) {
+        if (try_params(resolved, f.fmt, e)) {
             st_.enc = f.enc;
             LOG_INFO("ALSA opened: device=%s rate=%u ch=%u fmt=%s period=%u buffer=%u",
                      st_.device.c_str(), st_.rate, st_.channels,
@@ -108,41 +126,28 @@ void AlsaCapture::close() {
 }
 
 int AlsaCapture::wait_ms(int ms) {
-    if (!pcm_) return -1;
-    int count = snd_pcm_poll_descriptors_count(pcm_);
-    if (count <= 0) return -1;
-    struct pollfd pfds[8];
-    if (count > 8) count = 8;
-    snd_pcm_poll_descriptors(pcm_, pfds, unsigned(count));
-    int pr = poll(pfds, nfds_t(count), ms);
-    if (pr < 0) return -1;
-    unsigned short revents = 0;
-    snd_pcm_poll_descriptors_revents(pcm_, pfds, unsigned(count), &revents);
-    if (revents & POLLERR) {
-        LOG_WARN("ALSA poll error (device %s), recovering", st_.device.c_str());
-        st_.xruns++;
-        snd_pcm_recover(pcm_, -EPIPE, 1);
-        if (snd_pcm_state(pcm_) == SND_PCM_STATE_PREPARED) snd_pcm_start(pcm_);
-        return -1;
-    }
-    return (revents & POLLIN) ? 1 : 0;
+    if (!pcm_) return -EBADFD;
+    const int rc = snd_pcm_wait(pcm_, ms);
+    return rc < 0 ? recover_error(rc) : rc;
 }
 
 snd_pcm_sframes_t AlsaCapture::readi(void* dst, snd_pcm_uframes_t frames) {
-    snd_pcm_sframes_t r = snd_pcm_readi(pcm_, dst, frames);
-    if (r == -EPIPE) { // XRUN (buffer overrun) — recover immediately
-        st_.xruns++;
-        LOG_WARN("ALSA XRUN on %s (total %ld), recovering", st_.device.c_str(), st_.xruns);
-        int rc = snd_pcm_recover(pcm_, int(r), 0);
-        if (rc < 0) LOG_ERROR("snd_pcm_recover failed: %s", snd_strerror(rc));
-        if (snd_pcm_state(pcm_) == SND_PCM_STATE_PREPARED) snd_pcm_start(pcm_);
-    } else if (r < 0) {
-        LOG_WARN("snd_pcm_readi(%s): %s", st_.device.c_str(), snd_strerror(int(r)));
-        int rc = snd_pcm_recover(pcm_, int(r), 1);
-        if (rc < 0) LOG_ERROR("snd_pcm_recover failed: %s", snd_strerror(rc));
-        if (snd_pcm_state(pcm_) == SND_PCM_STATE_PREPARED) snd_pcm_start(pcm_);
-    }
-    return r;
+    if (!pcm_) return -EBADFD;
+    const auto rc = snd_pcm_readi(pcm_, dst, frames);
+    return rc < 0 ? recover_error(int(rc)) : rc;
+}
+
+int AlsaCapture::recover_error(int error) {
+    if (error != -EPIPE && error != -ESTRPIPE) return error;
+    if (error == -EPIPE) ++st_.xruns;
+    LOG_WARN("ALSA discontinuity on %s: %s (XRUNs %ld)",
+             st_.device.c_str(), snd_strerror(error), st_.xruns);
+    int rc = snd_pcm_recover(pcm_, error, 1);
+    if (rc >= 0 && snd_pcm_state(pcm_) == SND_PCM_STATE_PREPARED)
+        rc = snd_pcm_start(pcm_);
+    if (rc >= 0) return error;
+    LOG_ERROR("cannot recover %s: %s", st_.device.c_str(), snd_strerror(rc));
+    return (rc == -EPIPE || rc == -ESTRPIPE) ? -EIO : rc;
 }
 
 snd_pcm_sframes_t AlsaCapture::avail() const {
@@ -177,7 +182,7 @@ std::vector<CardInfo> list_cards() {
             }
             out.push_back(ci);
         } else {
-            // form without brackets: " 1: UAC1 - USB Audio" (older kernels)
+            // form without brackets: " 1: Loopback - Loopback" (older kernels)
             size_t colon2 = line.find(':');
             if (colon2 == std::string::npos) continue;
             std::string rest = trim_copy(line.substr(colon2 + 1));

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # install_service.sh — install audiostackd as a systemd service
-# targets: Qualcomm Linux (Debian) / Fedora (systemd common)
+# targets: Ubuntu for Qualcomm / Fedora (systemd common)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if [[ $EUID -ne 0 ]]; then echo "run as root: sudo ./scripts/install_service.sh"; exit 1; fi
+if [[ $EUID -ne 0 ]]; then echo "run as root: sudo bash scripts/install_service.sh"; exit 1; fi
 
 command -v audiostackd >/dev/null || cmake --install build
 
@@ -25,3 +25,5 @@ echo
 echo "logs: journalctl -u audiostack -f"
 echo "control: astk-ctl status | astk-ctl 'session rotate'"
 echo "after editing config: systemctl restart audiostack"
+echo "existing configuration is preserved; verify [capture] device and native_rate"
+echo "check the selected input first: docs/UBUNTU-INPUT.md or docs/XVF3800.md"

@@ -1,11 +1,12 @@
 // ============================================================================
 // Audio format conversion: encodings (s16/s32/f32) <-> float, channel
 // extraction, resampling. The pipeline target matches the Whisper standard
-// input: 16,000 Hz / mono / S16_LE. (The Rubik Pi 3 on-board mic captures at
-// 48 kHz, so software resampling is applied; the ReSpeaker v2.0 is native 16k.)
+// input: 16,000 Hz / mono / S16_LE. The RUBIK Pi 3 3.5 mm headset input is
+// configured for 48 kHz capture, followed by software resampling to 16 kHz.
 // ============================================================================
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -84,8 +85,7 @@ inline float rms_to_dbfs(float r) {
 class Resampler {
 public:
     Resampler(double in_rate, double out_rate)
-        : in_rate_(in_rate), out_rate_(out_rate),
-          step_(in_rate / out_rate), pos_(0.0),
+        : step_(in_rate / out_rate), pos_(0.0),
           int_ratio_(std::fabs(step_ - std::round(step_)) < 1e-9 && step_ > 1.0
                          ? int(step_)
                          : 0) {}
@@ -93,7 +93,6 @@ public:
     void process(const float* in, size_t n, std::vector<float>& out) {
         if (int_ratio_ > 0) {
             // box-average decimation (integer ratio)
-            acc_ = 0.0f; cnt_ = 0;
             for (size_t i = 0; i < n; i++) {
                 acc_ += in[i];
                 if (++cnt_ == int_ratio_) {
@@ -110,18 +109,17 @@ public:
             out.push_back(float((1.0 - fr) * buf_[i] + fr * buf_[i + 1]));
             pos_ += step_;
         }
-        size_t keep = size_t(pos_);
-        if (keep > 1) keep = 1;
-        if (keep > 0) {
-            buf_.erase(buf_.begin(), buf_.begin() + long(keep));
-            pos_ -= double(keep);
+        const size_t consumed = std::min(size_t(pos_), buf_.size());
+        if (consumed > 0) {
+            buf_.erase(buf_.begin(), buf_.begin() + consumed);
+            pos_ -= double(consumed);
         }
     }
 
     void reset() { buf_.clear(); pos_ = 0.0; acc_ = 0.0f; cnt_ = 0; }
 
 private:
-    double in_rate_, out_rate_, step_, pos_;
+    double step_, pos_;
     int int_ratio_ = 0;
     float acc_ = 0.0f;
     int cnt_ = 0;

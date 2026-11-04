@@ -8,6 +8,7 @@
 #include "audiostack/http_client.hpp"
 #include "audiostack/ipc_server.hpp"
 #include "audiostack/log.hpp"
+#include "audiostack/preprocess.hpp"
 #include "audiostack/protocol.hpp"
 #include "audiostack/ring_buffer.hpp"
 #include "audiostack/session.hpp"

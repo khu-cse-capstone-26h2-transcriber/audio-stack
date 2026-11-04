@@ -4,9 +4,9 @@
 //   * 16 kHz / S16_LE / mono baseline, period 20 ms (320 samples),
 //     buffer 80 ms (4 periods)
 //   * poll()-based async I/O + snd_pcm_recover() on XRUN
-// If the hardware demands a different rate (e.g. the Rubik Pi 3 on-board mic
-// at plughw:0,2, 48 kHz), open it at native_rate/channels and the upstream
-// pipeline converts to 16k mono.
+// The RUBIK Pi 3 3.5 mm headset microphone input uses 48 kHz in the board
+// configuration (plughw:0,2 in the official example). Open at native_rate/channels;
+// the upstream pipeline converts to 16k mono.
 // ============================================================================
 #pragma once
 
@@ -34,9 +34,9 @@ struct PcmInfo {
 class AlsaCapture {
 public:
     struct Request {
-        std::string device = "default"; // plughw:1,0 / hw:CARD=Array / default
+        std::string device = "default"; // generic library default; daemon selects the board input
         unsigned rate = 16000;          // requested (fails if hardware cannot do it)
-        unsigned channels = 1;          // 6 for the ReSpeaker 6-channel firmware
+        unsigned channels = 1;          // all channels exposed by the chosen capture profile
         unsigned period_ms = 20;        // survey: 320 samples @16k
         unsigned buffer_periods = 4;    // survey: 1280 samples = 4 periods
     };
@@ -61,14 +61,16 @@ public:
     size_t period_bytes() const { return size_t(st_.period_frames) * st_.channels * bytes_per_sample(st_.enc); }
     unsigned period_frames() const { return st_.period_frames; }
 
-    // wait for data: 1=ready, 0=timeout, -1=error (recovery attempted)
+    // 1=ready, 0=timeout, negative errno on error.
+    // -EPIPE/-ESTRPIPE indicate a recovered discontinuity for both calls.
     int wait_ms(int ms);
-    // read `frames` frames. -EPIPE (XRUN) etc. handled by internal recover.
+    // Read up to `frames` interleaved frames.
     snd_pcm_sframes_t readi(void* dst, snd_pcm_uframes_t frames);
     // unread frames currently in the buffer
     snd_pcm_sframes_t avail() const;
 
 private:
+    int recover_error(int error);
     bool try_params(const Request& req, snd_pcm_format_t fmt, std::string& err);
     snd_pcm_t* pcm_ = nullptr;
     Status st_ {};

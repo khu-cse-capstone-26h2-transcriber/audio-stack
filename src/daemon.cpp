@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <condition_variable>
@@ -22,6 +23,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -35,16 +37,17 @@ static void handle_signal(int) { g_stop = true; }
 
 // ---------------------------------------------------------------- options --
 struct Options {
-    std::string config_path, device, backend_url, engine_socket, log_level;
+    std::string config_path, device, backend_url, engine_socket, log_level, denoise;
     bool no_backend = false, help = false, version = false;
 };
 
 static void usage() {
     std::printf(
-        "audiostackd — on-device STT audio stack daemon (Rubik Pi 3 / Fedora)\n"
+        "audiostackd - on-device STT audio stack (RUBIK Pi 3 / Ubuntu for Qualcomm)\n"
         "usage: audiostackd [options]\n"
         "  --config=PATH        config file (INI). default: ./audiostack.conf, /etc/audiostack/audiostack.conf\n"
-        "  --device=ALSA_DEV    capture device override (e.g. plughw:1,0 / hw:CARD=Array)\n"
+        "  --device=ALSA_DEV    capture PCM (default: plughw:0,2, 3.5 mm headset input)\n"
+        "  --denoise=MODE       override [pre] denoise: off or rnnoise\n"
         "  --backend-url=URL    Node backend base URL (e.g. http://127.0.0.1:3000)\n"
         "  --engine-socket=PATH engine IPC socket path\n"
         "  --no-backend         disable backend HTTP delivery (engine/local testing only)\n"
@@ -71,6 +74,7 @@ static bool parse_args(int argc, char** argv, Options& o) {
         else if (a == "--no-backend") o.no_backend = true;
         else if (is_opt("--config")) { if (!take_value(o.config_path)) return false; }
         else if (is_opt("--device")) { if (!take_value(o.device)) return false; }
+        else if (is_opt("--denoise")) { if (!take_value(o.denoise) || o.denoise.empty()) return false; }
         else if (is_opt("--backend-url")) { if (!take_value(o.backend_url)) return false; }
         else if (is_opt("--engine-socket")) { if (!take_value(o.engine_socket)) return false; }
         else if (is_opt("--log-level")) { if (!take_value(o.log_level)) return false; }
@@ -216,7 +220,7 @@ static std::string resolve_socket_path(const std::string& p) {
 }
 
 // ------------------------------------------------------------------- main --
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     Options opt;
     if (!parse_args(argc, argv, opt)) return 2;
     if (opt.help) { usage(); return 0; }
@@ -249,41 +253,56 @@ int main(int argc, char** argv) {
 
     // ---- capture configuration --------------------------------------------
     AlsaCapture::Request req;
-    req.device = !opt.device.empty() ? opt.device : cfg.get("capture", "device", "default");
-    req.channels = unsigned(cfg.get_int("capture", "channels", 1));
-    req.period_ms = unsigned(cfg.get_int("capture", "period_ms", 20));
-    req.buffer_periods = unsigned(cfg.get_int("capture", "buffer_periods", 4));
-    const unsigned target_rate = unsigned(cfg.get_int("pre", "resample_to", 16000));
-    const size_t ch_idx = size_t(cfg.get_int("capture", "channel_index", 0));
+    req.device = !opt.device.empty() ? opt.device : cfg.get("capture", "device", "plughw:0,2");
+    const int channels = cfg.get_int("capture", "channels", 1);
+    const int channel_index = cfg.get_int("capture", "channel_index", 0);
+    const int period_ms = cfg.get_int("capture", "period_ms", 20);
+    const int buffer_periods = cfg.get_int("capture", "buffer_periods", 4);
+    const int output_rate = cfg.get_int("pre", "resample_to", 16000);
+    const int native_rate = cfg.get_int("capture", "native_rate", 48000);
+    const bool strict_rate = cfg.get_bool("capture", "strict_rate", false);
+    if (channels < 1 || channel_index < 0 || channel_index >= channels)
+        throw std::invalid_argument("[capture] channel_index must be in [0, channels)");
+    if (period_ms < 1 || buffer_periods < 2 || output_rate < 1 ||
+        native_rate < 0 || (strict_rate && native_rate == 0))
+        throw std::invalid_argument("invalid capture period, buffer, or sample rate");
+    req.channels = unsigned(channels);
+    req.period_ms = unsigned(period_ms);
+    req.buffer_periods = unsigned(buffer_periods);
+    const unsigned target_rate = unsigned(output_rate);
+    const size_t chunk_samples = size_t(target_rate) * req.period_ms / 1000;
+    if (chunk_samples == 0 || chunk_samples > kMaxPayload / sizeof(int16_t))
+        throw std::invalid_argument("audio chunk size is outside the ASTK frame limits");
     const double gate_db = cfg.get_double("pre", "silence_gate_db", -45.0);
     const double hpz = cfg.get_double("pre", "highpass_hz", 50.0);
+    const std::string denoise = opt.denoise.empty() ? cfg.get("pre", "denoise", "off") : opt.denoise;
+    if (denoise != "off" && denoise != "rnnoise")
+        throw std::invalid_argument("[pre] denoise must be off or rnnoise");
+    if (denoise == "rnnoise" && !Preprocessor::rnnoise_available())
+        throw std::invalid_argument("RNNoise requested but not built; configure with -DASTK_ENABLE_RNNOISE=ON");
 
     AlsaCapture capture;
     bool opened = false;
     std::string err;
-    unsigned try_rates[4] = {unsigned(cfg.get_int("capture", "native_rate", 0)), target_rate, 48000, 44100};
+    const unsigned try_rates[4] = {unsigned(native_rate), target_rate, 48000, 44100};
     for (unsigned r : try_rates) {
         if (r == 0) continue;
         req.rate = r;
         if (capture.open(req, err)) { opened = true; break; }
+        if (strict_rate) break;
     }
     if (!opened) {
         LOG_ERROR("cannot open capture device '%s': %s", req.device.c_str(), err.c_str());
-        LOG_ERROR("hint: check cards with astk-list-devices, verify audio group membership; "
-                  "the on-board mic needs amixer routing (see README)");
+        LOG_ERROR("hint: check arecord -l, capture format and permissions; "
+                  "see docs/XVF3800.md or docs/UBUNTU-INPUT.md");
         return 1;
     }
     const auto cst = capture.status();
 
-    // ---- pre-processing (50 Hz high-pass, 16k mono) ------------------------
-    Biquad hp;
-    const bool use_hp = hpz > 0;
-    if (use_hp) hp = make_highpass(hpz, double(cst.rate));
-    std::unique_ptr<Resampler> rs;
-    if (cst.rate != target_rate) {
-        rs = std::make_unique<Resampler>(double(cst.rate), double(target_rate));
-        LOG_INFO("resampling %u -> %u Hz (software)", cst.rate, target_rate);
-    }
+    Preprocessor pre({cst.rate, target_rate, cst.channels, unsigned(channel_index),
+                      hpz, denoise == "rnnoise"});
+    LOG_INFO("preprocess: channel_index=%d, %u -> %u Hz mono, highpass=%g Hz, denoise=%s",
+             channel_index, cst.rate, target_rate, hpz, denoise.c_str());
 
     // ---- engine IPC --------------------------------------------------------
     const std::string transport = cfg.get("engine", "transport", "socket");
@@ -340,6 +359,8 @@ int main(int argc, char** argv) {
     session.begin();
     std::atomic<uint64_t> frames_in {0}, chunks_sent {0}, chunks_dropped {0}, results_fwd {0};
     std::atomic<int> level_db_x10 {-1400};
+    std::atomic<long> capture_xruns {0};
+    std::atomic<bool> capture_failed {false};
     std::atomic<bool> engine_conn {false};
 
     SpscRing<std::shared_ptr<Chunk>> ring(2048); // ~40 s of buffering (20 ms chunks)
@@ -378,78 +399,62 @@ int main(int argc, char** argv) {
 
     // ---- capture thread ------------------------------------------------------
     std::thread cap_th([&] {
-        std::vector<uint8_t> raw(capture.period_bytes());
-        std::vector<float> fbuf, rbuf;
-        std::vector<int16_t> mono;
-        while (!g_stop.load()) {
-            int w = capture.wait_ms(200);
-            if (w != 1) continue;
-            snd_pcm_sframes_t fr = capture.readi(raw.data(), capture.period_frames());
-            if (fr <= 0) continue;
+        try {
+            std::vector<uint8_t> raw(capture.period_bytes());
+            std::vector<int16_t> mono, pending;
+            pending.reserve(chunk_samples);
+            auto check_capture_error = [&](int rc) {
+                if (rc == -EPIPE || rc == -ESTRPIPE) {
+                    capture_xruns.store(capture.status().xruns);
+                    pre.reset();
+                    pending.clear();
+                } else if (rc < 0 && rc != -EINTR && rc != -EAGAIN) {
+                    throw std::runtime_error(snd_strerror(rc));
+                }
+            };
+            while (!g_stop.load()) {
+                const int w = capture.wait_ms(200);
+                if (w != 1) { check_capture_error(w); continue; }
+                const auto fr = capture.readi(raw.data(), capture.period_frames());
+                if (fr <= 0) { check_capture_error(int(fr)); continue; }
+                ++frames_in;
+                pre.process(raw.data(), size_t(fr), cst.enc, mono);
 
-            to_float_mono(raw.data(), size_t(fr), cst.channels, ch_idx, cst.enc, fbuf);
-            if (use_hp)
-                for (float& x : fbuf) x = float(hp.process(x));
-            const float* src = fbuf.data();
-            size_t n = fbuf.size();
-            if (rs) {
-                rbuf.clear();
-                rs->process(fbuf.data(), fbuf.size(), rbuf);
-                src = rbuf.data();
-                n = rbuf.size();
-            }
-            if (n == 0) continue;
-            mono.resize(n);
-            float_to_s16(src, n, mono.data());
+                // Repacketize once, before live delivery, cache and shared memory.
+                // ALSA short reads and the RNNoise frame size are independent of ASTK.
+                for (size_t pos = 0; pos < mono.size();) {
+                    const size_t take = std::min(chunk_samples - pending.size(), mono.size() - pos);
+                    pending.insert(pending.end(), mono.begin() + pos, mono.begin() + pos + take);
+                    pos += take;
+                    if (pending.size() != chunk_samples) continue;
+                    auto c = std::make_shared<Chunk>();
+                    c->pcm.assign(pending.begin(), pending.end());
+                    pending.clear();
+                    const float db = rms_to_dbfs(rms(c->pcm.data(), c->pcm.size()));
+                    level_db_x10.store(int(db * 10));
+                    c->t_us = now_us();
+                    c->silence = db < gate_db;
+                    if (!ring.push(c)) ++chunks_dropped;
+                    shm.write(c->pcm.data(), c->pcm.size() * sizeof(int16_t));
 
-            float db = rms_to_dbfs(rms(mono.data(), n));
-            level_db_x10.store(int(db * 10));
-
-            auto c = std::make_shared<Chunk>();
-            c->pcm = std::move(mono);
-            c->t_us = now_us();
-            c->silence = db < gate_db;
-            mono = std::vector<int16_t>(); // ready for reuse after the move
-
-            if (!ring.push(c)) chunks_dropped++;
-            frames_in++;
-            shm.write(c->pcm.data(), c->pcm.size() * 2); // no-op when not opened (transport=socket)
-
-            {
-                std::lock_guard<std::mutex> lk(cache_mu);
-                cache_samples += c->pcm.size();
-                cache.push_back(c);
-                while (cache_samples > cache_limit && !cache.empty()) {
-                    cache_samples -= cache.front()->pcm.size();
-                    cache.pop_front();
+                    std::lock_guard<std::mutex> lk(cache_mu);
+                    cache_samples += c->pcm.size();
+                    cache.push_back(c);
+                    while (cache_samples > cache_limit) {
+                        cache_samples -= cache.front()->pcm.size();
+                        cache.pop_front();
+                    }
                 }
             }
+        } catch (const std::exception& e) {
+            LOG_ERROR("capture/preprocessing stopped: %s", e.what());
+            capture_failed = true;
+            g_stop = true;
         }
     });
 
     // ---- IPC thread (engine + control sockets) -------------------------------
     std::thread ipc_th([&] {
-        const size_t chunk_samples = size_t(target_rate) * size_t(req.period_ms) / 1000;
-        std::vector<int16_t> agg;
-        uint64_t agg_t_us = 0;
-        bool agg_silence = true;
-
-        auto flush_agg = [&](bool final_chunk) {
-            if (agg.empty() || !ipc.has_client()) {
-                agg.clear();
-                agg_t_us = 0;
-                agg_silence = true;
-                return;
-            }
-            uint16_t flags = agg_silence ? kFlagSilence : kFlagNone;
-            if (final_chunk) flags |= kFlagFinal;
-            ipc.send_audio(agg.data(), agg.size(), flags, agg_t_us);
-            chunks_sent++;
-            agg.clear();
-            agg_t_us = 0;
-            agg_silence = true;
-        };
-
         ipc.on_client([&](bool connected) {
             engine_conn.store(connected);
             if (!connected) return;
@@ -503,9 +508,11 @@ int main(int argc, char** argv) {
                      ",\"native_rate\":" + std::to_string(cst.rate) +
                      ",\"target_rate\":" + std::to_string(target_rate) +
                      ",\"channels\":" + std::to_string(cst.channels) +
+                     ",\"channel_index\":" + std::to_string(channel_index) +
                      ",\"period_frames\":" + std::to_string(cst.period_frames) +
                      ",\"buffer_frames\":" + std::to_string(cst.buffer_frames) +
-                     ",\"xruns\":" + std::to_string(cst.xruns) + "}";
+                     ",\"xruns\":" + std::to_string(capture_xruns.load()) + "}";
+                j += ",\"pre\":{\"denoise\":" + json_str(denoise) + "}";
                 j += ",\"engine_connected\":" + std::string(ipc.has_client() ? "true" : "false");
                 j += ",\"frames_in\":" + std::to_string(frames_in.load()) +
                      ",\"chunks_sent\":" + std::to_string(chunks_sent.load()) +
@@ -573,15 +580,14 @@ int main(int argc, char** argv) {
                 }
             }
 
-            // forward audio chunks (period_ms == chunk_ms recommended: 1:1)
+            // Capture has already assembled complete output chunks.
             if (ipc.has_client()) {
                 std::shared_ptr<Chunk> c;
                 int budget = 64;
                 while (budget-- > 0 && ring.pop(c)) {
-                    agg.insert(agg.end(), c->pcm.begin(), c->pcm.end());
-                    if (agg_t_us == 0) agg_t_us = c->t_us;
-                    agg_silence = agg_silence && c->silence;
-                    if (agg.size() >= chunk_samples) flush_agg(false);
+                    ipc.send_audio(c->pcm.data(), c->pcm.size(),
+                                   c->silence ? kFlagSilence : kFlagNone, c->t_us);
+                    ++chunks_sent;
                 }
             }
 
@@ -594,7 +600,6 @@ int main(int argc, char** argv) {
                 ipc.send_json(MSG_HEARTBEAT, j);
             }
         }
-        flush_agg(true);
     });
 
     cap_th.join();
@@ -617,5 +622,8 @@ int main(int argc, char** argv) {
     LOG_INFO("audiostackd stopped (frames_in=%llu sent=%llu dropped=%llu results=%llu)",
              (unsigned long long)frames_in.load(), (unsigned long long)chunks_sent.load(),
              (unsigned long long)chunks_dropped.load(), (unsigned long long)results_fwd.load());
-    return 0;
+    return capture_failed.load() ? 1 : 0;
+} catch (const std::exception& e) {
+    LOG_ERROR("%s", e.what());
+    return 1;
 }

@@ -7,6 +7,8 @@ It binds an engine.sock exactly like audiostackd does (HELLO / SESSION_BEGIN /
 or the real Whisper pipeline) runs completely unchanged. Received RESULT frames
 are printed and optionally forwarded to the backend (same JSON envelope the
 C++ daemon sends), so the whole SSE demo flow works without any hardware.
+This is the software-input alternative to Ubuntu for Qualcomm / RUBIK Pi 3
+3.5 mm headset capture. It bypasses ALSA and the C++ capture/preprocessing path.
 
 usage:
   python3 tools/feed_wav.py samples/jfk.wav                     # real-time
@@ -55,20 +57,25 @@ def parse_results(buf):
     return frames, buf
 
 
+def post_json(base_url, path, obj):
+    body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(base_url.rstrip("/") + path,
+                                 data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=3) as response:
+            response.read()
+    except Exception as e:  # backend optional for local tests
+        print(f"[feed-wav] backend POST {path} failed: {e}", file=sys.stderr)
+
+
 def post_to_backend(base_url, session_id, seq, transcript_obj, audio_t_us):
-    body = json.dumps({
+    post_json(base_url, f"/api/sessions/{session_id}/transcripts", {
         "session_id": session_id,
         "seq": seq,
         "received_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "audio_t_us": audio_t_us,
         "transcript": transcript_obj,
-    }, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(base_url.rstrip("/") + f"/api/sessions/{session_id}/transcripts",
-                                 data=body, headers={"Content-Type": "application/json"})
-    try:
-        urllib.request.urlopen(req, timeout=3).read()
-    except Exception as e:  # backend optional for local tests
-        print(f"[feed-wav] backend POST failed: {e}", file=sys.stderr)
+    })
 
 
 def main():
@@ -82,7 +89,15 @@ def main():
     ap.add_argument("--loop", action="store_true", help="repeat the file(s) forever")
     ap.add_argument("--gate-db", type=float, default=-45.0, help="silence flag threshold")
     ap.add_argument("--backend-url", default="", help="optional: forward RESULTs to this base URL")
+    ap.add_argument("--finalize-seconds", type=float, default=30.0,
+                    help="maximum wait for final engine results after SESSION_END (default 30)")
     args = ap.parse_args()
+    if args.chunk_ms <= 0 or TARGET_RATE * 2 * args.chunk_ms // 1000 > 1 << 20:
+        ap.error("--chunk-ms must be positive and fit the 1 MiB frame limit")
+    if not math.isfinite(args.speed) or args.speed <= 0:
+        ap.error("--speed must be finite and positive")
+    if not math.isfinite(args.finalize_seconds) or args.finalize_seconds < 0:
+        ap.error("--finalize-seconds must be finite and nonnegative")
 
     path = args.socket or os.environ.get("ASTK_ENGINE_SOCKET", "/run/audiostack/engine.sock")
 
@@ -125,10 +140,10 @@ def main():
                 nonlocal rbuf, seq
                 while True:
                     if not select.select([conn], [], [], 0)[0]:
-                        return
+                        return True
                     data = conn.recv(65536)
                     if not data:
-                        return
+                        return False
                     rbuf += data
                     frames, rbuf = parse_results(rbuf)
                     for fr in frames:
@@ -145,6 +160,12 @@ def main():
                                   json.loads(fr["payload"].decode("utf-8")), flush=True)
 
             session_id = "sess-feed-" + time.strftime("%Y%m%d-%H%M%S")
+            if args.backend_url:
+                post_json(args.backend_url, "/api/sessions", {
+                    "session_id": session_id,
+                    "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "device": "file:" + ";".join(p for p, _ in files),
+                })
             c.send_frame(MsgType.HELLO, json.dumps({
                 "proto": 1, "name": "feed_wav", "version": "0.1.0",
                 "format": {"rate": TARGET_RATE, "channels": 1, "encoding": "s16le"},
@@ -160,7 +181,6 @@ def main():
                 for p, pcm in files:
                     print(f"[feed-wav] streaming {p} …", flush=True)
                     deadline = time.perf_counter()
-                    t_base = int(time.monotonic() * 1e6)
                     for i in range(0, len(pcm), chunk_bytes):
                         chunk = pcm[i:i + chunk_bytes]
                         flags = Flags.SILENCE if rms_db(chunk) < args.gate_db else 0
@@ -178,12 +198,17 @@ def main():
             c.send_frame(MsgType.SESSION_END,
                          json.dumps({"session_id": session_id}).encode("utf-8"))
             c.send_frame(MsgType.GOODBYE, b'{"reason":"file done"}')
-            # linger: give the engine time to emit its closing RESULT
-            # (its VAD needs trailing silence before it finalizes)
-            end = time.monotonic() + 3.0
+            # SESSION_END lets the engine flush the trailing utterance. Drain
+            # until it closes or the configurable finalization deadline expires.
+            end = time.monotonic() + args.finalize_seconds
             while time.monotonic() < end:
-                drain()
+                if not drain():
+                    break
                 time.sleep(0.05)
+            if args.backend_url:
+                post_json(args.backend_url, f"/api/sessions/{session_id}/end", {
+                    "ended_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                })
             conn.close()
             if not args.loop:
                 print("[feed-wav] done")
@@ -199,4 +224,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

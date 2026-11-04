@@ -1,5 +1,11 @@
 # Sample audio files
 
+Software input is the current integration path while physical microphone input
+is unavailable. The board target is Ubuntu for Qualcomm with a microphone on
+the 3.5 mm headset jack. These files can be used with `tools/feed_wav.py` without
+an audio device, or with `scripts/feed_wav_loopback.sh` to include ALSA and the
+C++ daemon when the kernel provides snd-aloop. See the root README for commands.
+
 - `jfk.wav` — from the whisper.cpp repository (MIT license). 16 kHz / mono /
   s16, 11 s. Expected text (en):
   *"And so my fellow Americans ask not what your country can do for you, ask

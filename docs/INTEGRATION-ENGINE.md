@@ -11,6 +11,23 @@ lives in **`client/whisper_engine.py`** (it also has an `--wav` offline mode).
 Without any microphone, stream a file with `tools/feed_wav.py`, or test the
 real daemon through a loopback card with `scripts/feed_wav_loopback.sh`.
 
+The board runs Ubuntu for Qualcomm. It can use the 3.5 mm headset mic input or
+an [XVF3800 USB input profile](XVF3800.md). A selected USB beam and optional
+RNNoise processing both stay on the daemon side of the protocol.
+The current default board profile is `plughw:0,2`, 48 kHz converted to 16 kHz.
+Until microphone input is available, start these in separate terminals:
+
+```bash
+python3 tools/feed_wav.py samples/jfk.wav --socket /tmp/astk-file/engine.sock
+python3 tests/dummy_engine.py --socket /tmp/astk-file/engine.sock
+# Replace the second command with the real engine when ready.
+```
+
+Use that same explicit socket path in the real engine. Do not start audiostackd
+on the feeder's socket. This test validates the protocol, not ALSA or acoustic
+capture. See [Ubuntu and input setup](UBUNTU-INPUT.md) for the loopback and board
+tests. Keep VAD and inference in the engine when changing the capture source.
+
 ```python
 import sys
 sys.path.insert(0, "client")

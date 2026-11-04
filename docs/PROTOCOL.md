@@ -6,6 +6,13 @@ this document to integrate.
 
 ## 0. Data flow
 
+Board target: Ubuntu for Qualcomm on RUBIK Pi 3. The daemon can open the
+3.5 mm headset mic or select a processed beam from the
+[XVF3800 USB array](XVF3800.md).
+`tools/feed_wav.py` provides software input with the same wire format; it
+replaces the daemon's socket server and bypasses ALSA capture and preprocessing.
+An snd-aloop test exercises the actual daemon; see [input setup](UBUNTU-INPUT.md).
+
 ```
 mic (ALSA) → audiostackd → [AUDIO frames] → Whisper engine
                 ↑                  [RESULT frame (JSON)] ↓
@@ -13,8 +20,9 @@ mic (ALSA) → audiostackd → [AUDIO frames] → Whisper engine
 ```
 
 - Fixed audio format: **16,000 Hz / mono / S16_LE** (the Whisper standard input)
-- Pre-processing (50 Hz high-pass, resampling, channel extraction) happens in
-  the daemon — the engine receives inference-ready PCM.
+- Channel selection, optional high-pass and RNNoise, resampling and framing
+  happen in the daemon. USB multichannel capture does not change the mono
+  engine payload, including when cached frames are replayed.
 
 ## 1. Engine IPC (AF_UNIX SOCK_STREAM)
 
@@ -33,7 +41,7 @@ of audio with the `kFlagCached` flag, then continues live.
 | 5  | 1    | type         | see table below |
 | 6  | 2    | flags        | bit0 silence, bit1 cached, bit2 final |
 | 8  | 4    | seq          | sender counter |
-| 12 | 8    | t_us         | CLOCK_MONOTONIC µs (capture instant for AUDIO) |
+| 12 | 8    | t_us         | CLOCK_MONOTONIC µs (daemon capture-side timestamp for AUDIO, after preprocessing) |
 | 20 | 4    | payload_len  | ≤ 1 MiB |
 
 ### Message types
@@ -106,7 +114,7 @@ The daemon POSTs JSON (Content-Type: `application/json`, Connection: close) to
 
 | path | body |
 |------|------|
-| `/api/sessions` | `{"session_id":"sess-20261012-153001-4f2a","started_at":"2026-10-12T15:30:01Z","device":"plughw:1,0"}` |
+| `/api/sessions` | `{"session_id":"sess-20261012-153001-4f2a","started_at":"2026-10-12T15:30:01Z","device":"plughw:0,2"}` |
 | `/api/sessions/{session}/transcripts` | `{"session_id":...,"seq":N,"received_at":ISO,"audio_t_us":µs,"transcript":{RESULT payload}}` |
 | `/api/sessions/{session}/end` | `{"session_id":...,"ended_at":ISO}` |
 

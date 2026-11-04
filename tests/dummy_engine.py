@@ -74,9 +74,18 @@ def main():
                 speech_bytes = 0
         elif f.type == MsgType.HEARTBEAT:
             pass
-        elif f.type in (MsgType.SESSION_END, MsgType.GOODBYE):
+        elif f.type == MsgType.SESSION_END:
             print("[dummy-engine] session ended:", f.json(), flush=True)
+            if speech_bytes:
+                utter += 1
+                secs = speech_bytes / 2 / 16000
+                c.send_result(f"[dummy transcript {utter}] utterance {secs:.1f}s detected",
+                              kind="final", t_start_ms=0, t_end_ms=int(secs * 1000), conf=0.0)
             speech_bytes = 0
+            silence_ms = 0
+        elif f.type == MsgType.GOODBYE:
+            break
+    c.close()
 
 
 if __name__ == "__main__":

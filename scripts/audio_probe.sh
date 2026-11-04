@@ -1,66 +1,62 @@
 #!/usr/bin/env bash
-# ============================================================================
-# audio_probe.sh — check mic hardware / kernel drivers / latency basics.
-# usage: ./scripts/audio_probe.sh [--device plughw:1,0]
-# ============================================================================
-set -uo pipefail
+# Diagnose the RUBIK Pi 3 3.5 mm headset input on Ubuntu for Qualcomm.
+# Usage: bash scripts/audio_probe.sh [--device plughw:0,2]
+# Omitting --device lists devices without starting a recording or changing routing.
+set -euo pipefail
 cd "$(dirname "$0")/.."
 
 DEVICE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --device) DEVICE="$2"; shift 2 ;;
-    *) echo "unknown arg: $1"; exit 2 ;;
+    --device)
+      [[ $# -ge 2 && -n $2 ]] || { echo "--device needs an ALSA PCM" >&2; exit 2; }
+      DEVICE="$2"; shift 2 ;;
+    --help) echo "usage: $0 [--device plughw:0,2]"; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
-echo "=== 1) kernel sound cards (/proc/asound/cards) ==="
-cat /proc/asound/cards
-echo
-echo "=== 2) PCM streams (/proc/asound/pcm) ==="
-cat /proc/asound/pcm
-echo
-echo "=== 3) USB audio devices (lsusb) ==="
-command -v lsusb >/dev/null && lsusb -v 2>/dev/null | grep -E "^Bus|idVendor|idProduct|iProduct" | head -40 || echo "lsusb not installed"
-echo
-echo "=== 4) audio server occupancy ==="
-if pgrep -x pipewire >/dev/null; then
-  echo "⚠ PipeWire is running — the daemon opening hw:/plughw: directly may conflict."
-  echo "  option A (recommended, low latency): systemctl --user stop pipewire pipewire-pulse"
-  echo "  option B: set [capture] device = default in audiostack.conf (via PipeWire)"
-elif pgrep -x pulseaudio >/dev/null; then
-  echo "⚠ PulseAudio is running — the survey decided against it; run the daemon alone:"
-  echo "  systemctl --user stop pulseaudio"
+echo "=== Sound cards and capture PCMs ==="
+if [[ -r /proc/asound/cards ]]; then cat /proc/asound/cards; fi
+if [[ -r /proc/asound/pcm ]]; then cat /proc/asound/pcm; fi
+if command -v arecord >/dev/null; then arecord -l || true; fi
+if [[ -x build/astk-list-devices ]]; then build/astk-list-devices || true; fi
+
+echo "=== Audio server occupancy ==="
+if pgrep -x pipewire >/dev/null || pgrep -x pulseaudio >/dev/null; then
+  echo "A sound server is running. Direct ALSA may be busy; inspect fuser /dev/snd/*."
+  echo "See docs/UBUNTU-INPUT.md before stopping a server or choosing a bridge PCM."
 else
-  echo "no audio server running — direct ALSA use is fine"
+  echo "No PulseAudio/PipeWire process detected; device availability still needs testing."
 fi
-echo
-echo "=== 5) device selection ==="
+
 if [[ -z "$DEVICE" ]]; then
-  if [[ -x build/astk-list-devices ]]; then
-    build/astk-list-devices || true
-  fi
-  echo "re-run with an explicit device: ./scripts/audio_probe.sh --device plughw:<c>,<d>"
+  echo "Connect a microphone/headset to the 3.5 mm jack and configure its mixer route."
+  echo "Then run: $0 --device plughw:0,2 (adjust the card and PCM to your image)."
+  echo "Without a microphone: use tools/feed_wav.py; see README.md."
   exit 0
 fi
-echo "test capture: $DEVICE (16 kHz mono S16_LE, 3 s)"
-TMP=/tmp/astk_probe_$$.wav
-if arecord -D "$DEVICE" -f S16_LE -r 16000 -c 1 -d 3 -t wav "$TMP" 2>/tmp/astk_probe_err; then
-  echo "  OK → $TMP"
-  echo "  native 16 kHz confirmed (e.g. ReSpeaker v2.0)"
-else
-  echo "  16 kHz failed — retrying at 48 kHz:"
-  if arecord -D "$DEVICE" -f S16_LE -r 48000 -c 1 -d 3 -t wav "$TMP" 2>>/tmp/astk_probe_err; then
-    echo "  OK → $TMP (daemon will capture at 48k and resample to 16k in software)"
-  else
-    echo "  capture failed:"; cat /tmp/astk_probe_err
-    echo "  check: audio group membership, amixer routing (on-board mic), device connection"
-    exit 1
+command -v arecord >/dev/null || { echo "install alsa-utils first" >&2; exit 1; }
+
+PROBE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/astk-probe.XXXXXX")
+echo "=== Capture $DEVICE: mono S16_LE, 3 seconds ==="
+# The board profile prefers 48 kHz, then resamples in the daemon.
+CAPTURED=0
+for RATE in 48000 16000; do
+  if arecord -D "$DEVICE" -f S16_LE -r "$RATE" -c 1 -d 3 -t wav \
+      "$PROBE_DIR/input.wav" 2>"$PROBE_DIR/capture.err"; then
+    echo "Capture succeeded at requested rate $RATE: $PROBE_DIR/input.wav"
+    echo "plughw may convert the rate; this does not establish native hardware support."
+    CAPTURED=1
+    break
   fi
+done
+if [[ $CAPTURED -eq 0 ]]; then
+  cat "$PROBE_DIR/capture.err" >&2
+  echo "Check 3.5 mm microphone compatibility, mixer routing, permissions and device ownership." >&2
+  exit 1
 fi
-echo
-echo "=== 6) daemon pipeline check (if built) ==="
 if [[ -x build/astk-capture-wav ]]; then
-  build/astk-capture-wav --device "$DEVICE" --seconds 3 --out /tmp/astk_pipe.wav \
-    && echo "  OK → /tmp/astk_pipe.wav (16k mono, 50 Hz HP, resampling included)"
+  build/astk-capture-wav --device "$DEVICE" --seconds 3 --out "$PROBE_DIR/pipeline.wav"
+  echo "Pipeline output (16 kHz mono, high-pass and resampling): $PROBE_DIR/pipeline.wav"
 fi

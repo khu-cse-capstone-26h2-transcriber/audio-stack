@@ -1,8 +1,5 @@
 // astk-list-devices — inspect and suggest ALSA capture devices.
 // usage: astk-list-devices [--json]
-#include <dirent.h>
-#include <unistd.h>
-
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -23,49 +20,33 @@ int main(int argc, char** argv) {
         for (auto& c : cards)
             std::printf("  card %d: id=%-20s name=%s\n", c.num, c.id.c_str(), c.name.c_str());
         std::printf("\n=== /proc/asound/pcm (capture streams) ===\n");
-        for (auto& p : pcms)
-            if (p.capture)
+        for (auto& p : pcms) {
+            if (p.capture) {
+                const char* card_id = "?";
+                for (const auto& c : cards)
+                    if (c.num == p.card) { card_id = c.id.c_str(); break; }
                 std::printf("  plughw:%d,%d  card=%s  %s\n", p.card, p.device,
-                            p.card < (int)cards.size() ? cards[p.card].id.c_str() : "?", p.name.c_str());
-        std::printf("\n=== /dev/snd/by-id (USB audio symlinks) ===\n");
-        DIR* d = opendir("/dev/snd/by-id");
-        bool any = false;
-        if (d) {
-            struct dirent* e;
-            while ((e = readdir(d))) {
-                if (e->d_name[0] == '.') continue;
-                std::printf("  %s\n", e->d_name);
-                any = true;
+                            card_id, p.name.c_str());
             }
-            closedir(d);
         }
-        if (!any) std::printf("  (none — no USB audio attached or by-id unsupported)\n");
-
         std::printf("\n=== suggestions ===\n");
-        // 1) USB mics (ReSpeaker etc.) first, 2) Rubik Pi 3 on-board plughw:0,2, 3) default
-        for (auto& c : cards) {
-            bool usb = c.name.find("USB") != std::string::npos ||
-                       c.id.find("UAC") != std::string::npos ||
-                       c.name.find("ReSpeaker") != std::string::npos ||
-                       c.id.find("Array") != std::string::npos;
-            if (usb) {
-                for (auto& p : pcms)
-                    if (p.card == c.num && p.capture) {
-                        std::printf("  USB mic candidate: plughw:%d,%d  (--device '%s')\n", p.card, p.device,
-                                    ("plughw:CARD=" + c.id).c_str());
-                    }
-            }
-        }
+        // Prioritize the onboard 3.5 mm microphone input on Ubuntu for Qualcomm.
         for (auto& c : cards) {
             if (c.id.find("qcs6490") != std::string::npos || c.name.find("RB3") != std::string::npos ||
                 c.name.find("q6") != std::string::npos) {
-                std::printf("  Rubik Pi/RB3 on-board card detected (id=%s). Mic input is usually device 2:\n",
+                std::printf("  RUBIK Pi/RB3 onboard audio card detected (id=%s).\n",
                             c.id.c_str());
-                std::printf("    amixer -c %d cset \"name=MultiMedia3 Mixer PRIMARY_MI2S_TX\" 1\n", c.num);
-                std::printf("    --device plughw:%d,2   (per official docs; may vary by firmware)\n", c.num);
+                for (const auto& p : pcms) {
+                    if (p.card != c.num || p.device != 2 || !p.capture) continue;
+                    std::printf("  3.5 mm headset microphone candidate (verify the image's route):\n");
+                    std::printf("    amixer -c %d cset \"name=MultiMedia3 Mixer PRIMARY_MI2S_TX\" 1\n", c.num);
+                    std::printf("    --device plughw:CARD=%s,DEV=2   (48 kHz board profile)\n", c.id.c_str());
+                }
             }
         }
-        std::printf("  otherwise: --device default (ALSA default capture)\n");
+        std::printf("  Select a listed capture PCM if the board's device numbering differs.\n");
+        std::printf("  Without a microphone (see README.md):\n"
+                    "    python3 tools/feed_wav.py samples/jfk.wav --socket /tmp/astk-file/engine.sock\n");
     } else {
         std::printf("{\"cards\":[");
         for (size_t i = 0; i < cards.size(); i++) {
