@@ -15,6 +15,7 @@ usage:
   python3 tools/feed_wav.py samples/jfk.wav --no-realtime       # burst (fast test)
   python3 tools/feed_wav.py samples/synth_speech.wav --loop     # continuous
   python3 tools/feed_wav.py samples/jfk.wav --backend-url http://127.0.0.1:3000
+  python3 tools/feed_wav.py samples/jfk.wav --backend-url http://127.0.0.1:3000 --backend-prefix /api/device/sessions
 """
 import argparse
 import array
@@ -68,8 +69,8 @@ def post_json(base_url, path, obj):
         print(f"[feed-wav] backend POST {path} failed: {e}", file=sys.stderr)
 
 
-def post_to_backend(base_url, session_id, seq, transcript_obj, audio_t_us):
-    post_json(base_url, f"/api/sessions/{session_id}/transcripts", {
+def post_to_backend(base_url, prefix, session_id, seq, transcript_obj, audio_t_us):
+    post_json(base_url, f"{prefix}/{session_id}/transcripts", {
         "session_id": session_id,
         "seq": seq,
         "received_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -89,6 +90,9 @@ def main():
     ap.add_argument("--loop", action="store_true", help="repeat the file(s) forever")
     ap.add_argument("--gate-db", type=float, default=-45.0, help="silence flag threshold")
     ap.add_argument("--backend-url", default="", help="optional: forward RESULTs to this base URL")
+    ap.add_argument("--backend-prefix", default="/api/sessions",
+                    help="session path on the backend, like [backend] session_path "
+                         "(transcripts and end go under PREFIX/{session}/)")
     ap.add_argument("--finalize-seconds", type=float, default=30.0,
                     help="maximum wait for final engine results after SESSION_END (default 30)")
     args = ap.parse_args()
@@ -113,6 +117,7 @@ def main():
         print(f"[feed-wav] loaded {p}: {dur:.2f} s @16k mono s16")
 
     chunk_bytes = TARGET_RATE * 2 * args.chunk_ms // 1000
+    prefix = "/" + args.backend_prefix.strip("/")
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     try:
@@ -153,7 +158,7 @@ def main():
                             print(f"[feed-wav] RESULT #{seq}: {obj.get('type')} "
                                   f"\"{obj.get('text','')}\"", flush=True)
                             if args.backend_url:
-                                post_to_backend(args.backend_url, session_id, seq,
+                                post_to_backend(args.backend_url, prefix, session_id, seq,
                                                 obj, fr["t_us"])
                         elif fr["type"] == MsgType.ENGINE_STATUS:
                             print("[feed-wav] engine status:",
@@ -161,7 +166,7 @@ def main():
 
             session_id = "sess-feed-" + time.strftime("%Y%m%d-%H%M%S")
             if args.backend_url:
-                post_json(args.backend_url, "/api/sessions", {
+                post_json(args.backend_url, prefix, {
                     "session_id": session_id,
                     "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "device": "file:" + ";".join(p for p, _ in files),
@@ -206,7 +211,7 @@ def main():
                     break
                 time.sleep(0.05)
             if args.backend_url:
-                post_json(args.backend_url, f"/api/sessions/{session_id}/end", {
+                post_json(args.backend_url, f"{prefix}/{session_id}/end", {
                     "ended_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 })
             conn.close()
