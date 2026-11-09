@@ -389,10 +389,42 @@ int main(int argc, char** argv) try {
                         ",\"device\":" + json_str(cst.device) + "}";
         backend.enqueue(bc.session_path, b);
     };
-    auto post_session_end = [&](const std::string& id) {
+    auto post_session_end = [&](const std::string& id, const std::string& ended_at) {
         std::string b = "{\"session_id\":" + json_str(id) +
-                        ",\"ended_at\":" + json_str(iso8601_now()) + "}";
+                        ",\"ended_at\":" + json_str(ended_at) + "}";
         backend.enqueue(substitute_path(bc.end_path, id), b);
+    };
+
+    // Session ids issued by this daemon that results may still arrive for. After
+    // SESSION_END the engine still finalizes the open utterance, so its last
+    // RESULT arrives after the rotate; the engine names that session in
+    // RESULT.session_id. Only ids in this list are trusted (IPC thread only).
+    std::deque<std::string> recent_sessions;
+    auto remember_session = [&](const std::string& id) {
+        recent_sessions.push_back(id);
+        while (recent_sessions.size() > 8) recent_sessions.pop_front();
+    };
+    // Ended sessions whose /end POST waits for the engine's
+    // ENGINE_STATUS {"event":"session_done","session_id":...} (sent after the
+    // session's last RESULT), at most end_wait_ms (IPC thread only).
+    const int end_wait_ms = cfg.get_int("engine", "end_wait_ms", 5000);
+    struct PendingEnd { std::string id, ended_at; uint64_t deadline_us; };
+    std::vector<PendingEnd> pending_end;
+    auto finish_session = [&](const std::string& id) { // after SESSION_END went to the engine
+        remember_session(id);
+        if (end_wait_ms > 0 && ipc.has_client())
+            pending_end.push_back({id, iso8601_now(), now_us() + uint64_t(end_wait_ms) * 1000ull});
+        else
+            post_session_end(id, iso8601_now());
+    };
+    auto release_pending_end = [&](const std::string& id) -> bool {
+        for (auto it = pending_end.begin(); it != pending_end.end(); ++it) {
+            if (it->id != id) continue;
+            post_session_end(id, it->ended_at);
+            pending_end.erase(it);
+            return true;
+        }
+        return false;
     };
     post_session_begin();
     if (ipc.has_client()) ipc.send_json(MSG_SESSION_BEGIN, "{\"session_id\":" + json_str(session.id) + "}");
@@ -480,16 +512,29 @@ int main(int argc, char** argv) try {
                 std::string transcript = (!payload.empty() && payload.front() == '{')
                                              ? payload
                                              : ("{\"type\":\"final\",\"text\":" + json_str(payload) + "}");
-                std::string body = "{\"session_id\":" + json_str(session.id) +
+                // file the result under the session its audio belongs to, if the
+                // engine says so and it is a recent session of ours
+                std::string sid = session.id, eng_sid;
+                if (json_top_string(transcript, "session_id", eng_sid) && eng_sid != sid &&
+                    std::find(recent_sessions.begin(), recent_sessions.end(), eng_sid) != recent_sessions.end()) {
+                    LOG_DEBUG("late result for %s (current %s)", eng_sid.c_str(), sid.c_str());
+                    sid = eng_sid;
+                }
+                std::string body = "{\"session_id\":" + json_str(sid) +
                                    ",\"seq\":" + std::to_string(results_fwd.load() + 1) +
                                    ",\"received_at\":" + json_str(iso8601_now()) +
                                    ",\"audio_t_us\":" + std::to_string(f.t_us) +
                                    ",\"transcript\":" + transcript + "}";
-                backend.enqueue(substitute_path(bc.transcript_path, session.id), body);
+                backend.enqueue(substitute_path(bc.transcript_path, sid), body);
                 results_fwd++;
                 LOG_DEBUG("result -> backend: %.120s", payload.c_str());
             } else if (f.type == MSG_ENGINE_STATUS) {
-                LOG_INFO("engine status: %.200s", f.payload_str().c_str());
+                const std::string st = f.payload_str();
+                LOG_INFO("engine status: %.200s", st.c_str());
+                std::string ev, sid;
+                if (json_top_string(st, "event", ev) && ev == "session_done" &&
+                    json_top_string(st, "session_id", sid) && release_pending_end(sid))
+                    LOG_DEBUG("engine finished %s; session end posted", sid.c_str());
             } else if (f.type == MSG_ERROR) {
                 LOG_WARN("engine error frame: %.200s", f.payload_str().c_str());
             }
@@ -517,7 +562,8 @@ int main(int argc, char** argv) try {
                 j += ",\"frames_in\":" + std::to_string(frames_in.load()) +
                      ",\"chunks_sent\":" + std::to_string(chunks_sent.load()) +
                      ",\"chunks_dropped\":" + std::to_string(chunks_dropped.load()) +
-                     ",\"results_forwarded\":" + std::to_string(results_fwd.load());
+                     ",\"results_forwarded\":" + std::to_string(results_fwd.load()) +
+                     ",\"sessions_ending\":" + std::to_string(pending_end.size());
                 j += ",\"backend\":{\"enabled\":" + std::string(bc.enabled ? "true" : "false") +
                      ",\"queued\":" + std::to_string(backend.queued()) +
                      ",\"sent\":" + std::to_string(backend.sent()) +
@@ -531,7 +577,7 @@ int main(int argc, char** argv) try {
                 if (session.active) {
                     std::string old = session.end();
                     ipc.send_json(MSG_SESSION_END, "{\"session_id\":" + json_str(old) + "}");
-                    post_session_end(old);
+                    finish_session(old);
                 }
                 session.begin();
                 post_session_begin();
@@ -592,6 +638,13 @@ int main(int argc, char** argv) try {
             }
 
             uint64_t now = now_us();
+            for (size_t i = 0; i < pending_end.size();) {
+                if (now < pending_end[i].deadline_us) { ++i; continue; }
+                LOG_WARN("no session_done from the engine for %s within %d ms; posting session end",
+                         pending_end[i].id.c_str(), end_wait_ms);
+                post_session_end(pending_end[i].id, pending_end[i].ended_at);
+                pending_end.erase(pending_end.begin() + long(i));
+            }
             if (ipc.has_client() && now - last_heartbeat >= 2000000ull) {
                 last_heartbeat = now;
                 std::string j = "{\"level_db\":" + std::to_string(double(level_db_x10.load()) / 10.0) +
@@ -611,9 +664,11 @@ int main(int argc, char** argv) try {
             ipc.send_json(MSG_SESSION_END, "{\"session_id\":" + json_str(session.id) + "}");
         ipc.send_json(MSG_GOODBYE, "{\"reason\":\"daemon shutdown\"}");
     }
+    for (const auto& p : pending_end) post_session_end(p.id, p.ended_at); // no more engine replies after this
+    pending_end.clear();
     if (session.active) {
         std::string id = session.end();
-        post_session_end(id);
+        post_session_end(id, iso8601_now());
     }
     ctrl.stop();
     ipc.stop();

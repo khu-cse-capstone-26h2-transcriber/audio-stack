@@ -75,13 +75,33 @@ of audio with the `kFlagCached` flag, then continues live.
   "lang": "ko",
   "t_start_ms": 1200,          // segment-relative times (optional)
   "t_end_ms": 4300,            // (optional)
-  "conf": 0.93                 // (optional)
+  "conf": 0.93,                // (optional)
+  "session_id": "sess-..."     // (optional) session the audio belonged to
 }
 ```
 
-Only `text` is required. The daemon does **not** parse this JSON — it forwards
-it verbatim to the backend. Plain (non-JSON) text is wrapped as
-`{"type":"final","text":"..."}`.
+Only `text` is required. The daemon forwards this JSON verbatim to the
+backend; the only field it reads is `session_id`. Plain (non-JSON) text is
+wrapped as `{"type":"final","text":"..."}`.
+
+- `session_id`: after `SESSION_END` the engine still finalizes the utterance
+  that was open, so that RESULT reaches the daemon after the next session has
+  begun. If `session_id` names one of the daemon's recent sessions (current or
+  last 8 ended), the daemon files the RESULT under it (URL and envelope);
+  otherwise under the session open when the RESULT arrives.
+
+### ENGINE_STATUS events the daemon acts on
+
+| payload | daemon action |
+|---|---|
+| `{"event":"session_done","session_id":"sess-..."}` | the engine has sent every RESULT of that session → the daemon POSTs `/end` for it |
+
+After `SESSION_END` the daemon waits for `session_done` up to
+`[engine] end_wait_ms` (default 5000) before POSTing `/end`, so the session's
+last transcript reaches the backend before its end. An engine that never sends
+`session_done` only delays `/end` by that much; `end_wait_ms = 0` restores the
+immediate `/end`. If no engine is connected at `SESSION_END`, `/end` is POSTed
+at once. Other ENGINE_STATUS payloads are logged only.
 
 ## 2. Shared-memory ring (optional, `[engine] transport = shm|both`)
 
@@ -116,7 +136,7 @@ The daemon POSTs JSON (Content-Type: `application/json`, Connection: close) to
 |------|------|
 | `/api/sessions` | `{"session_id":"sess-20261012-153001-4f2a","started_at":"2026-10-12T15:30:01Z","device":"plughw:0,2"}` |
 | `/api/sessions/{session}/transcripts` | `{"session_id":...,"seq":N,"received_at":ISO,"audio_t_us":µs,"transcript":{RESULT payload}}` |
-| `/api/sessions/{session}/end` | `{"session_id":...,"ended_at":ISO}` |
+| `/api/sessions/{session}/end` | `{"session_id":...,"ended_at":ISO}` — after the session's last transcript (see ENGINE_STATUS above) |
 
 - 2xx expected. If the backend is down, the daemon keeps up to `queue_max`
   (512) items and retries with `retry_seconds` backoff; beyond that it drops

@@ -141,4 +141,78 @@ inline std::string json_str(const std::string& s) {
     return out;
 }
 
+namespace detail {
+// Reads the JSON string starting at s[i] == '"' and leaves i after the closing
+// quote. Returns -1 if unterminated, 1 if it holds a \u escape (not decoded;
+// `out` is then incomplete), 0 otherwise. `out` may be null to skip.
+inline int json_read_string(const std::string& s, size_t& i, std::string* out) {
+    int rc = 0;
+    for (++i; i < s.size(); ++i) {
+        const char c = s[i];
+        if (c == '"') { ++i; return rc; }
+        if (c != '\\') { if (out) out->push_back(c); continue; }
+        if (++i >= s.size()) return -1;
+        switch (s[i]) {
+            case 'n': if (out) out->push_back('\n'); break;
+            case 'r': if (out) out->push_back('\r'); break;
+            case 't': if (out) out->push_back('\t'); break;
+            case 'b': if (out) out->push_back('\b'); break;
+            case 'f': if (out) out->push_back('\f'); break;
+            case 'u': rc = 1; break;
+            default:  if (out) out->push_back(s[i]); break; // " \ /
+        }
+    }
+    return -1;
+}
+} // namespace detail
+
+// Looks up a string member of the top-level JSON object (nested objects and
+// arrays are skipped). Used only for the few fields the daemon itself acts on
+// (RESULT/ENGINE_STATUS "session_id", "event"); payloads are still forwarded
+// verbatim. Returns false if the key is missing, not a string, or malformed.
+inline bool json_top_string(const std::string& s, const std::string& key, std::string& out) {
+    size_t i = s.find_first_not_of(" \t\r\n");
+    if (i == std::string::npos || s[i] != '{') return false;
+    int depth = 0;
+    bool expect_key = false;
+    auto skip_ws = [&] {
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
+    };
+    while (i < s.size()) {
+        const char c = s[i];
+        if (c == '"') {
+            if (depth == 1 && expect_key) {
+                std::string k;
+                const int rk = detail::json_read_string(s, i, &k);
+                if (rk < 0) return false;
+                skip_ws();
+                if (i >= s.size() || s[i] != ':') return false;
+                ++i;
+                skip_ws();
+                expect_key = false;
+                if (rk == 0 && k == key) {
+                    if (i >= s.size() || s[i] != '"') return false;
+                    std::string v;
+                    if (detail::json_read_string(s, i, &v) != 0) return false;
+                    out = std::move(v);
+                    return true;
+                }
+                continue;
+            }
+            if (detail::json_read_string(s, i, nullptr) < 0) return false;
+            continue;
+        }
+        if (c == '{' || c == '[') {
+            ++depth;
+            if (depth == 1) expect_key = true;
+        } else if (c == '}' || c == ']') {
+            if (--depth <= 0) return false;
+        } else if (c == ',' && depth == 1) {
+            expect_key = true;
+        }
+        ++i;
+    }
+    return false;
+}
+
 } // namespace astk
