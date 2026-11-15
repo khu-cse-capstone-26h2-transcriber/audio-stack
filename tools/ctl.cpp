@@ -1,5 +1,5 @@
 // astk-ctl — control-socket client for the daemon.
-// usage: astk-ctl [--socket PATH] status|stats|level|"session rotate"|shutdown
+// usage: astk-ctl [--socket PATH] status|stats|level|"session start"|"session stop"|"session rotate"|shutdown
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -20,7 +20,7 @@ int main(int argc, char** argv) {
     }
     if (words.empty()) {
         std::printf("usage: astk-ctl [--socket PATH] <command...>\n"
-                    "commands: status | stats | level | session rotate | shutdown | help\n");
+                    "commands: status | stats | level | session start | session stop | session rotate | shutdown | help\n");
         return 2;
     }
     std::string line;

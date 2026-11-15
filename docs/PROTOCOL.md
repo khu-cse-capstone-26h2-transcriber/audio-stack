@@ -148,7 +148,7 @@ The daemon POSTs JSON (Content-Type: `application/json`, Connection: close) to
 `/run/audiostack/ctrl.sock` — one text command per connection, reply then EOF:
 
 ```
-status | stats | level | session rotate | shutdown | help
+status | stats | level | session start | session stop | session rotate | shutdown | help
 ```
 
 ```bash
@@ -156,6 +156,19 @@ build/astk-ctl status
 echo 'session rotate' | socat - UNIX-CONNECT:/run/audiostack/ctrl.sock
 ```
 
-To trigger recording start/stop from the web app or a physical button, send
-`session rotate` to this socket (the daemon issues the session id; engine
-RESULTs carry it implicitly through the transcript envelope).
+Recording start/stop from the web app (or a button): run the daemon idle
+(`--idle` or `[session] autostart = false`) and send `session start` /
+`session stop` to this socket. The daemon issues the session id.
+
+| command | reply | effect |
+| --- | --- | --- |
+| `session start` | `OK <session_id>` | opens a session (`POST session_path`, engine `SESSION_BEGIN`); if one is open, returns its id |
+| `session stop` | `OK <session_id>` or `OK idle` | `SESSION_END` to the engine, `POST end_path` after `session_done`; then idle |
+| `session rotate` | `OK <new session_id>` | stop (if open) + start |
+
+While idle, audio is not sent to the engine and no result is POSTed (late
+results of the session just stopped are still delivered under that session).
+`status` reports `"recording": true|false`.
+
+Engine state to the backend (optional, `[backend] engine_path`):
+`POST engine_path {"event":"connected|disconnected|ready|error","session_id":"...","at":"ISO8601"[,"status":{ENGINE_STATUS}]}`.
