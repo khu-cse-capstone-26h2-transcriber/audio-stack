@@ -38,7 +38,7 @@ static void handle_signal(int) { g_stop = true; }
 // ---------------------------------------------------------------- options --
 struct Options {
     std::string config_path, device, backend_url, engine_socket, log_level, denoise;
-    bool no_backend = false, help = false, version = false;
+    bool no_backend = false, idle = false, help = false, version = false;
 };
 
 static void usage() {
@@ -51,6 +51,7 @@ static void usage() {
         "  --backend-url=URL    Node backend base URL (e.g. http://127.0.0.1:3000)\n"
         "  --engine-socket=PATH engine IPC socket path\n"
         "  --no-backend         disable backend HTTP delivery (engine/local testing only)\n"
+        "  --idle               start idle; record only between 'session start' and 'session stop'\n"
         "  --log-level=lv       trace|debug|info|warn|error\n"
         "  --version, --help\n");
 }
@@ -72,6 +73,7 @@ static bool parse_args(int argc, char** argv, Options& o) {
         if (a == "--help" || a == "-h") o.help = true;
         else if (a == "--version" || a == "-V") o.version = true;
         else if (a == "--no-backend") o.no_backend = true;
+        else if (a == "--idle") o.idle = true;
         else if (is_opt("--config")) { if (!take_value(o.config_path)) return false; }
         else if (is_opt("--device")) { if (!take_value(o.device)) return false; }
         else if (is_opt("--denoise")) { if (!take_value(o.denoise) || o.denoise.empty()) return false; }
@@ -102,6 +104,7 @@ public:
         std::string session_path = "/api/sessions";
         std::string transcript_path = "/api/sessions/{session}/transcripts";
         std::string end_path = "/api/sessions/{session}/end";
+        std::string engine_path; // empty = do not report engine state
         int timeout_ms = 3000;
         int retry_seconds = 3;
         int queue_max = 512;
@@ -349,6 +352,7 @@ int main(int argc, char** argv) try {
     bc.session_path = cfg.get("backend", "session_path", bc.session_path);
     bc.transcript_path = cfg.get("backend", "transcript_path", bc.transcript_path);
     bc.end_path = cfg.get("backend", "end_path", bc.end_path);
+    bc.engine_path = cfg.get("backend", "engine_path", "");
     bc.timeout_ms = cfg.get_int("backend", "timeout_ms", 3000);
     bc.retry_seconds = cfg.get_int("backend", "retry_seconds", 3);
     bc.queue_max = cfg.get_int("backend", "queue_max", 512);
@@ -356,7 +360,7 @@ int main(int argc, char** argv) try {
 
     // ---- session / stats ----------------------------------------------------
     Session session;
-    session.begin();
+    const bool autostart = !opt.idle && cfg.get_bool("session", "autostart", true);
     std::atomic<uint64_t> frames_in {0}, chunks_sent {0}, chunks_dropped {0}, results_fwd {0};
     std::atomic<int> level_db_x10 {-1400};
     std::atomic<long> capture_xruns {0};
@@ -389,13 +393,74 @@ int main(int argc, char** argv) try {
                         ",\"device\":" + json_str(cst.device) + "}";
         backend.enqueue(bc.session_path, b);
     };
-    auto post_session_end = [&](const std::string& id) {
+    auto post_session_end = [&](const std::string& id, const std::string& ended_at) {
         std::string b = "{\"session_id\":" + json_str(id) +
-                        ",\"ended_at\":" + json_str(iso8601_now()) + "}";
+                        ",\"ended_at\":" + json_str(ended_at) + "}";
         backend.enqueue(substitute_path(bc.end_path, id), b);
     };
-    post_session_begin();
-    if (ipc.has_client()) ipc.send_json(MSG_SESSION_BEGIN, "{\"session_id\":" + json_str(session.id) + "}");
+
+    // Session ids issued by this daemon that results may still arrive for. After
+    // SESSION_END the engine still finalizes the open utterance, so its last
+    // RESULT arrives after the rotate; the engine names that session in
+    // RESULT.session_id. Only ids in this list are trusted (IPC thread only).
+    std::deque<std::string> recent_sessions;
+    auto remember_session = [&](const std::string& id) {
+        recent_sessions.push_back(id);
+        while (recent_sessions.size() > 8) recent_sessions.pop_front();
+    };
+    // Ended sessions whose /end POST waits for the engine's
+    // ENGINE_STATUS {"event":"session_done","session_id":...} (sent after the
+    // session's last RESULT), at most end_wait_ms (IPC thread only).
+    const int end_wait_ms = cfg.get_int("engine", "end_wait_ms", 5000);
+    struct PendingEnd { std::string id, ended_at; uint64_t deadline_us; };
+    std::vector<PendingEnd> pending_end;
+    auto finish_session = [&](const std::string& id) { // after SESSION_END went to the engine
+        remember_session(id);
+        if (end_wait_ms > 0 && ipc.has_client())
+            pending_end.push_back({id, iso8601_now(), now_us() + uint64_t(end_wait_ms) * 1000ull});
+        else
+            post_session_end(id, iso8601_now());
+    };
+    auto release_pending_end = [&](const std::string& id) -> bool {
+        for (auto it = pending_end.begin(); it != pending_end.end(); ++it) {
+            if (it->id != id) continue;
+            post_session_end(id, it->ended_at);
+            pending_end.erase(it);
+            return true;
+        }
+        return false;
+    };
+    // Opens a new session. Audio captured before it (e.g. while idle) is not
+    // part of the session, so it is not replayed to a reconnecting engine.
+    auto start_session = [&]() {
+        {
+            std::lock_guard<std::mutex> lk(cache_mu);
+            cache.clear();
+            cache_samples = 0;
+        }
+        session.begin();
+        post_session_begin();
+        if (ipc.has_client()) ipc.send_json(MSG_SESSION_BEGIN, "{\"session_id\":" + json_str(session.id) + "}");
+    };
+    auto stop_session = [&]() -> std::string {
+        std::string old = session.end();
+        if (ipc.has_client()) ipc.send_json(MSG_SESSION_END, "{\"session_id\":" + json_str(old) + "}");
+        finish_session(old);
+        return old;
+    };
+    // Engine state -> backend ([backend] engine_path), e.g. so the web app can
+    // show that transcription stopped. Events: connected, disconnected (socket),
+    // ready, error (engine ENGINE_STATUS, passed through as "status").
+    auto post_engine_event = [&](const std::string& event, const std::string& status_json) {
+        if (bc.engine_path.empty()) return;
+        std::string b = "{\"event\":" + json_str(event) +
+                        ",\"session_id\":" + json_str(session.id) +
+                        ",\"at\":" + json_str(iso8601_now());
+        if (!status_json.empty() && status_json.front() == '{') b += ",\"status\":" + status_json;
+        backend.enqueue(bc.engine_path, b + "}");
+    };
+    if (autostart) start_session();
+    else LOG_INFO("idle: waiting for 'session start' on %s", ctrl_sock.c_str());
 
     // ---- capture thread ------------------------------------------------------
     std::thread cap_th([&] {
@@ -457,10 +522,11 @@ int main(int argc, char** argv) try {
     std::thread ipc_th([&] {
         ipc.on_client([&](bool connected) {
             engine_conn.store(connected);
+            post_engine_event(connected ? "connected" : "disconnected", "");
             if (!connected) return;
             ipc.send_json(MSG_HELLO, hello_json());
-            if (session.active)
-                ipc.send_json(MSG_SESSION_BEGIN, "{\"session_id\":" + json_str(session.id) + "}");
+            if (!session.active) return; // idle: nothing to resume
+            ipc.send_json(MSG_SESSION_BEGIN, "{\"session_id\":" + json_str(session.id) + "}");
             // replay the audio that would be lost while the engine was away
             // (within cache_seconds)
             std::deque<std::shared_ptr<Chunk>> replay;
@@ -480,16 +546,34 @@ int main(int argc, char** argv) try {
                 std::string transcript = (!payload.empty() && payload.front() == '{')
                                              ? payload
                                              : ("{\"type\":\"final\",\"text\":" + json_str(payload) + "}");
-                std::string body = "{\"session_id\":" + json_str(session.id) +
+                // file the result under the session its audio belongs to, if the
+                // engine says so and it is a recent session of ours
+                std::string sid = session.id, eng_sid;
+                if (json_top_string(transcript, "session_id", eng_sid) && eng_sid != sid &&
+                    std::find(recent_sessions.begin(), recent_sessions.end(), eng_sid) != recent_sessions.end()) {
+                    LOG_DEBUG("late result for %s (current %s)", eng_sid.c_str(), sid.c_str());
+                    sid = eng_sid;
+                }
+                if (sid.empty()) { // idle and not a late result of a recent session
+                    LOG_DEBUG("result while idle dropped: %.120s", payload.c_str());
+                    return;
+                }
+                std::string body = "{\"session_id\":" + json_str(sid) +
                                    ",\"seq\":" + std::to_string(results_fwd.load() + 1) +
                                    ",\"received_at\":" + json_str(iso8601_now()) +
                                    ",\"audio_t_us\":" + std::to_string(f.t_us) +
                                    ",\"transcript\":" + transcript + "}";
-                backend.enqueue(substitute_path(bc.transcript_path, session.id), body);
+                backend.enqueue(substitute_path(bc.transcript_path, sid), body);
                 results_fwd++;
                 LOG_DEBUG("result -> backend: %.120s", payload.c_str());
             } else if (f.type == MSG_ENGINE_STATUS) {
-                LOG_INFO("engine status: %.200s", f.payload_str().c_str());
+                const std::string st = f.payload_str();
+                LOG_INFO("engine status: %.200s", st.c_str());
+                std::string ev, sid;
+                json_top_string(st, "event", ev);
+                if (ev == "session_done" && json_top_string(st, "session_id", sid) && release_pending_end(sid))
+                    LOG_DEBUG("engine finished %s; session end posted", sid.c_str());
+                if (ev == "ready" || ev == "error") post_engine_event(ev, st);
             } else if (f.type == MSG_ERROR) {
                 LOG_WARN("engine error frame: %.200s", f.payload_str().c_str());
             }
@@ -497,12 +581,13 @@ int main(int argc, char** argv) try {
 
         auto ctrl_handler = [&](const std::string& line) -> std::string {
             if (line == "help")
-                return "commands: status | stats | level | session rotate | shutdown";
+                return "commands: status | stats | level | session start | session stop | session rotate | shutdown";
             if (line == "level")
                 return std::to_string(double(level_db_x10.load()) / 10.0);
             if (line == "status" || line == "stats") {
                 std::string j = "{";
-                j += "\"running\":true,\"session_id\":" + json_str(session.id) +
+                j += "\"running\":true,\"recording\":" + std::string(session.active ? "true" : "false") +
+                     ",\"session_id\":" + json_str(session.id) +
                      ",\"started_at\":" + json_str(session.started_at);
                 j += ",\"capture\":{\"device\":" + json_str(cst.device) +
                      ",\"native_rate\":" + std::to_string(cst.rate) +
@@ -517,7 +602,8 @@ int main(int argc, char** argv) try {
                 j += ",\"frames_in\":" + std::to_string(frames_in.load()) +
                      ",\"chunks_sent\":" + std::to_string(chunks_sent.load()) +
                      ",\"chunks_dropped\":" + std::to_string(chunks_dropped.load()) +
-                     ",\"results_forwarded\":" + std::to_string(results_fwd.load());
+                     ",\"results_forwarded\":" + std::to_string(results_fwd.load()) +
+                     ",\"sessions_ending\":" + std::to_string(pending_end.size());
                 j += ",\"backend\":{\"enabled\":" + std::string(bc.enabled ? "true" : "false") +
                      ",\"queued\":" + std::to_string(backend.queued()) +
                      ",\"sent\":" + std::to_string(backend.sent()) +
@@ -527,15 +613,22 @@ int main(int argc, char** argv) try {
                 j += "}";
                 return j;
             }
-            if (line == "session rotate") {
-                if (session.active) {
-                    std::string old = session.end();
-                    ipc.send_json(MSG_SESSION_END, "{\"session_id\":" + json_str(old) + "}");
-                    post_session_end(old);
+            if (line == "session start") { // idempotent: an open session is kept
+                if (!session.active) {
+                    start_session();
+                    LOG_INFO("session started -> %s", session.id.c_str());
                 }
-                session.begin();
-                post_session_begin();
-                ipc.send_json(MSG_SESSION_BEGIN, "{\"session_id\":" + json_str(session.id) + "}");
+                return "OK " + session.id;
+            }
+            if (line == "session stop") { // idempotent: OK idle when nothing is open
+                if (!session.active) return std::string("OK idle");
+                std::string old = stop_session();
+                LOG_INFO("session stopped: %s (idle)", old.c_str());
+                return "OK " + old;
+            }
+            if (line == "session rotate") {
+                if (session.active) stop_session();
+                start_session();
                 LOG_INFO("session rotated -> %s", session.id.c_str());
                 return "OK " + session.id;
             }
@@ -581,7 +674,10 @@ int main(int argc, char** argv) try {
             }
 
             // Capture has already assembled complete output chunks.
-            if (ipc.has_client()) {
+            if (!session.active) { // idle: audio is not sent to the engine
+                std::shared_ptr<Chunk> c;
+                while (ring.pop(c)) {}
+            } else if (ipc.has_client()) {
                 std::shared_ptr<Chunk> c;
                 int budget = 64;
                 while (budget-- > 0 && ring.pop(c)) {
@@ -592,6 +688,13 @@ int main(int argc, char** argv) try {
             }
 
             uint64_t now = now_us();
+            for (size_t i = 0; i < pending_end.size();) {
+                if (now < pending_end[i].deadline_us) { ++i; continue; }
+                LOG_WARN("no session_done from the engine for %s within %d ms; posting session end",
+                         pending_end[i].id.c_str(), end_wait_ms);
+                post_session_end(pending_end[i].id, pending_end[i].ended_at);
+                pending_end.erase(pending_end.begin() + long(i));
+            }
             if (ipc.has_client() && now - last_heartbeat >= 2000000ull) {
                 last_heartbeat = now;
                 std::string j = "{\"level_db\":" + std::to_string(double(level_db_x10.load()) / 10.0) +
@@ -611,9 +714,11 @@ int main(int argc, char** argv) try {
             ipc.send_json(MSG_SESSION_END, "{\"session_id\":" + json_str(session.id) + "}");
         ipc.send_json(MSG_GOODBYE, "{\"reason\":\"daemon shutdown\"}");
     }
+    for (const auto& p : pending_end) post_session_end(p.id, p.ended_at); // no more engine replies after this
+    pending_end.clear();
     if (session.active) {
         std::string id = session.end();
-        post_session_end(id);
+        post_session_end(id, iso8601_now());
     }
     ctrl.stop();
     ipc.stop();

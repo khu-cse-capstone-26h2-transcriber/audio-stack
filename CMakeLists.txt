@@ -69,6 +69,9 @@ if(BUILD_TESTING)
   add_executable(astk-preprocess-test tests/test_preprocess.cpp)
   target_link_libraries(astk-preprocess-test PRIVATE astk)
   add_test(NAME preprocess COMMAND astk-preprocess-test)
+  add_executable(astk-protocol-test tests/test_protocol.cpp)
+  target_link_libraries(astk-protocol-test PRIVATE astk)
+  add_test(NAME protocol COMMAND astk-protocol-test)
 endif()
 
 # ---------------------------------------------------------------- install ---
